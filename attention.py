@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
-BACKENDS = ("explicit", "math", "flash", "l1", "l2")
+BACKENDS = ("explicit", "math", "flash", "l1", "l2", "l3")
 L1_MAX_N = 512
 
 
@@ -19,7 +19,8 @@ def _load_cuda(backend):
     from torch.utils.cpp_extension import load
 
     root = Path(__file__).resolve().parent
-    source = {"l1": "l1_materialized.cu", "l2": "l2_tiled_online.cu"}[backend]
+    source = {"l1": "l1_materialized.cu", "l2": "l2_tiled_online.cu",
+              "l3": "l3_wmma_online.cu"}[backend]
     return load(
         name=f"attention_lab_{backend}",
         sources=[str(root / "bindings.cu"), str(root / "kernels" / source)],
@@ -72,12 +73,12 @@ def prepare_l1(q, k, v, causal=False):
     return run
 
 
-def prepare_l2(q, k, v, causal=False):
-    """L2 只创建输出；分块数据与在线状态全部留在 kernel 内。"""
+def prepare_fused(q, k, v, backend, causal=False):
+    """融合后端只创建输出；分块数据与在线状态全部留在 kernel 内。"""
     validate_inputs(q, k, v)
     if q.device.type != "cuda":
-        raise ValueError("L2 仅支持 CUDA")
-    module = _load_cuda("l2")
+        raise ValueError(f"{backend.upper()} 仅支持 CUDA")
+    module = _load_cuda(backend)
     output = torch.empty_like(q)
 
     def run():
@@ -87,12 +88,24 @@ def prepare_l2(q, k, v, causal=False):
     return run
 
 
+def prepare_l2(q, k, v, causal=False):
+    """创建 L2 固定输出，供计时复用。"""
+    return prepare_fused(q, k, v, "l2", causal)
+
+
+def prepare_l3(q, k, v, causal=False):
+    """创建 L3 固定输出，供计时复用。"""
+    return prepare_fused(q, k, v, "l3", causal)
+
+
 def attention(q, k, v, backend="explicit", causal=False):
     """公开入口；每次调用都明确限定一个后端，禁止自动回退。"""
     if backend == "l1":
         return prepare_l1(q, k, v, causal)()
     if backend == "l2":
         return prepare_l2(q, k, v, causal)()
+    if backend == "l3":
+        return prepare_l3(q, k, v, causal)()
     validate_inputs(q, k, v)
     if backend == "explicit":
         return explicit_attention(q, k, v, causal)

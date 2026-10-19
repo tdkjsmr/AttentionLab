@@ -10,6 +10,10 @@ void l1_forward(
 void l2_forward(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const at::Tensor& output, bool causal);
+#elif defined(ATTENTION_LAB_L3)
+void l3_forward(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const at::Tensor& output, bool causal);
 #else
 #error "请选择本次编译的 CUDA 阶段"
 #endif
@@ -19,5 +23,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &l1_forward, "L1：QK、稳定 softmax、PV");
 #elif defined(ATTENTION_LAB_L2)
     m.def("forward", &l2_forward, "L2：融合分块与在线 softmax");
+#elif defined(ATTENTION_LAB_L3)
+    m.def("forward", &l3_forward, "L3：WMMA 分块与在线 softmax");
 #endif
 }
