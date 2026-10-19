@@ -1,6 +1,6 @@
 # AttentionLab
 
-Dense 自注意力 Prefill forward 的分阶段实验。当前只有 L0，尚未包含自定义 CUDA kernel；阶段编号不对应官方 FlashAttention 的版本号。
+Dense 自注意力 Prefill forward 的分阶段实验。当前包含 L0 与 L1；L1 为显式保存 S/P 的三个 CUDA kernel。阶段编号不对应官方 FlashAttention 的版本号。
 
 ## 计算约定
 
@@ -17,11 +17,13 @@ Dense 自注意力 Prefill forward 的分阶段实验。当前只有 L0，尚未
 
 | 文件 | 作用 |
 | --- | --- |
-| `attention.py` | 显式公式、CPU FP64 逐行参考、强制 SDPA math/flash |
+| `attention.py` | 显式公式、CPU FP64 逐行参考、强制 SDPA math/flash、L1 加载与缓冲创建 |
 | `bench.py` | 环境记录、正确性、计时和计时外显存检查 |
+| `bindings.cu` | 公共 Python 绑定声明 |
+| `kernels/l1_materialized.cu` | L1 的 QK、稳定 softmax、PV 和启动代码 |
 | `.gitignore` | 排除本地环境、缓存和机器相关结果 |
 
-L0 建立公式与统一测量入口。下一阶段 L1 才增加 QK、稳定 softmax、PV 三个可读 CUDA kernel，并显式保存 N*N 中间矩阵；当前没有预建后续实现。
+L0 建立公式与统一测量入口。L1 用三个可读 CUDA kernel 显式保存 N*N 中间矩阵；当前没有预建后续实现。
 
 ## L0：先理解一行 attention
 
@@ -40,11 +42,33 @@ causal 情况下则分别对允许访问的 V 前缀求均值。
 
 建议先阅读 `explicit_attention` 的三个计算步骤，再看 `reference_fp64`；其余测量代码按需阅读。
 
+## L1：从行索引到三个 kernel
+
+Q/K/V 的连续存储偏移为 `((b*H+h)*N+i)*D+t`。CUDA 中合并 `bh=b*H+h`，保持相同布局。
+每个 kernel 固定 128 线程，即 4 个 warp；一个 block 负责一个 `(bh,i)` 行：
+
+| kernel | 线程负责什么 | 结果 |
+| --- | --- | --- |
+| QK | 线程依次处理 `j=tid, tid+128, ...`，串行累积 D 个分量 | FP32 `S[bh,i,j]` |
+| softmax | 各线程读若干列，shared memory 树形归约最大值与指数和 | FP32 `P[bh,i,j]` |
+| PV | 线程负责一个输出分量 t，串行累积 N 个 value | FP16 `O[bh,i,t]` |
+
+QK 中先将 causal 的未来位置写为负无穷；softmax 先减行最大值，再求指数与归一化。
+QK、softmax 的列循环处理 N 尾部，PV 只让 `t<D` 的线程写输出。softmax 没有有效列的线程仍参与同步和归约。
+三个 kernel 按顺序在 PyTorch 当前 CUDA stream 上执行，不在启动之间插入设备同步。
+
+L1 的用途是理解索引、线程职责、归约和中间张量，未使用 Tensor Core 或矩阵乘法分块。N 限制为 512，保持小尺寸；N=2048 等记录为跳过。
+点积与加权和使用 FP32 FMA，S/P 为 FP32；验收仍使用同一套固定阈值。
+
+`prepare_l1` 先创建 S/P/O，返回复用这些缓冲的调用入口；返回的输出会在下一次调用中被覆盖。
+计时使用该入口，编译与分配在计时外。正确性入口和 memory 模式则在每次调用内创建缓冲。
+
 ## 环境
 
 需要 Python、PyTorch，以及提供 `torch.nn.attention.sdpa_kernel` 的版本。CUDA 验证需要可用的 CUDA PyTorch 与 GPU。
 L0 不编译扩展，不要求安装官方 flash-attn；`nvcc` 不存在时版本字段记录为 null。
-尚未固定或验证云端依赖版本，实际版本由每次运行的 environment 记录给出。不要据此假定最新 PyTorch 与现有驱动兼容。
+L0 已在 RTX 3090、Python 3.12.3、PyTorch 2.5.1+cu124、CUDA toolkit 12.4.131 上完成 D64 的 noncausal/causal 小尺寸验证和 noncausal 代表尺寸测量。
+这是已验证的环境组合，实际版本仍由每次运行的 environment 记录给出；完整依赖锁定尚未建立。L1 当前仅通过本地静态检查，云端编译与 GPU 验证待完成。
 
 优先复用已确认可用的云镜像所提供的 PyTorch，但为本仓库建立独立环境，不对已有项目环境执行安装。
 以下方式让独立环境读取当前基础解释器的包，前提是当前解释器不属于其他项目的 venv，且其 torch/CUDA 已检查可用：
@@ -83,7 +107,29 @@ python bench.py --mode memory --n 128 512 2048 --output results/l0.jsonl
 
 先分析 D64，再按需用 `--head-dim 128` 检查 D128。无需第一轮运行所有参数组合。
 CPU 环境可以运行 `python bench.py --device cpu --mode verify`，该结果不覆盖 CUDA 和 flash，也不输出 GPU 性能。
-默认比较 explicit/math/flash；可用 `--backends explicit math` 定点排查，但这不算完成 flash 验证。
+默认比较 explicit/math/flash/l1；CPU 明确跳过 flash 和 l1。
+可用 `--backends explicit math flash` 保持 L0 的运行范围。
+
+L1 第一次调用使用 `torch.utils.cpp_extension.load` 编译，需要可用的 nvcc、C++ 编译器和 Ninja。
+以下命令针对已激活的独立环境和 RTX 3090，先执行小尺寸正确性验证：
+
+```bash
+export TORCH_CUDA_ARCH_LIST=8.6
+export MAX_JOBS=1
+nvcc --version
+c++ --version
+ninja --version
+python bench.py --mode verify --backends l1 --output results/l1.jsonl
+python bench.py --mode verify --backends l1 --causal --output results/l1.jsonl
+```
+
+Ninja 缺失时，在当前 `.venv` 内安装 `ninja` 即可，不重装 torch。编译错误保留完整信息；构建失败时只报告一次并停止本轮。
+两个 mask 的验证通过后，才运行相同输入的配对测量：
+
+```bash
+python bench.py --mode bench --n 128 512 --output results/l1.jsonl
+python bench.py --mode memory --n 128 512 --output results/l1.jsonl
+```
 
 ## 正确性口径
 
@@ -99,14 +145,14 @@ CPU 环境可以运行 `python bench.py --device cpu --mode verify`，该结果�
 ## 测量口径
 
 - 默认 B1/H8/D64，N128/512/2048；eager、无梯度、同一个 CUDA stream。
-- 预热 10 次，CUDA events 包围每组 100 次调用，组末等待，取 5 组每次耗时的中位数，同时保存各组值。
-- 输入生成、FP64 参考、打印、预热不计时；输出分配、显式 FP32 转换和中间张量分配计入各路径调用。
+- 预热 10 次，CUDA events 包围每组 100 次调用，组末等待，取 5 组每次耗时的中位数，同时保存各组值。L1 的首次 JIT 构建在此之前完成。
+- 输入生成、FP64 参考、打印、预热不计时；PyTorch 路径包含输出和内部张量分配，L1 的计时预分配 S/P/O。每条结果明确标记 allocation，不能把这种不同分配口径下的耗时比解释为纯 kernel 加速。
 - 短调用可能包含 Python 提交空洞，字段称 GPU elapsed，不声称纯内核时间。所有路径均为 eager，不混入 Graph 结果。
 - 显式路径的 FP32 运算与融合 flash 的中间精度不同，结果用于解释路径成本，不把耗时比直接归因为某一种优化。
 - memory 模式在计时之外测增量峰值 allocated，公共输入分配计入 baseline；不混 reserved，不在循环中 empty_cache。
-- PyTorch 没有通过此处公共接口暴露实际内部 workspace，`workspace_bytes=null`。S/P 的 `2*B*H*N*N*4` 只表示两张 FP32 矩阵的理论字节数，不是总峰值或实测 DRAM 流量。
+- SDPA 等 PyTorch 内部 workspace 未通过此处接口暴露，`workspace_bytes=null`；L1 的 workspace 已知为 S/P 两张 FP32 矩阵，记录 `2*B*H*N*N*4` 字节，输出单列。该字节数不是总峰值或实测 DRAM 流量。
 - 默认 S/P 理论预算 512 MiB，超出则跳过代表形状；实际 OOM 同样记录。此预算也限制配对参考路径，因此可能连同本来可运行的 flash 一起跳过。
-- 每次运行只追加一种 JSONL 结果，通过 run_id 关联 environment 与数据行；记录 SHA、dirty、GPU、torch/CUDA/nvcc、精度、mask、形状、预热与次数。当前 tile/warps 未由实验控制，记 null。
+- 每次运行只追加一种 JSONL 结果，通过 run_id 关联 environment 与数据行；记录 SHA、dirty、GPU、torch/CUDA/nvcc、精度、mask、形状、预热与次数。SDPA 的内部 tile/warps 未由实验控制，记 null；L1 记录固定的 128 线程和 4 个 warp。
 
 ## 来源
 

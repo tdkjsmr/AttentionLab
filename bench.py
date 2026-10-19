@@ -1,4 +1,4 @@
-"""统一执行 L0 正确性、CUDA events 计时及计时外显存检查。"""
+"""统一执行已实现后端的正确性、CUDA events 计时及计时外显存检查。"""
 
 import argparse
 from datetime import datetime, timezone
@@ -12,7 +12,7 @@ import uuid
 
 import torch
 
-from attention import BACKENDS, attention, reference_fp64
+from attention import BACKENDS, L1_MAX_N, attention, prepare_l1, reference_fp64
 
 
 ROOT = Path(__file__).resolve().parent
@@ -103,8 +103,8 @@ def verify(args, device, emit):
             row = {"kind": "verify", "backend": backend, "case": kind,
                    "shape": list(q.shape), "case_seed": args.seed + index,
                    "reference": "cpu_fp64_rowwise"}
-            if device.type == "cpu" and backend == "flash":
-                emit(**row, status="skipped", reason="CPU 模式没有 CUDA flash 覆盖")
+            if device.type == "cpu" and backend in ("flash", "l1"):
+                emit(**row, status="skipped", reason="CPU 模式没有 CUDA 后端覆盖")
                 continue
             try:
                 metrics = errors(attention(q, k, v, backend, args.causal), expected)
@@ -114,10 +114,16 @@ def verify(args, device, emit):
             except (RuntimeError, NotImplementedError) as exc:
                 # 后端不可用也是本次验证未通过；不以另一个后端替代。
                 emit(**row, status="error", reason=str(exc))
+                if backend == "l1":
+                    # 编译失败只报告一次，停止本轮，避免每个形状重复构建。
+                    emit(kind="verify_summary", status="fail", failed_cases=failures + 1,
+                         cuda_flash_verified=False, cuda_l1_verified=False)
+                    return failures + 1
                 failures += 1
     emit(kind="verify_summary", status="pass" if failures == 0 else "fail",
          failed_cases=failures,
-         cuda_flash_verified=device.type == "cuda" and "flash" in args.backends and failures == 0)
+         cuda_flash_verified=device.type == "cuda" and "flash" in args.backends and failures == 0,
+         cuda_l1_verified=device.type == "cuda" and "l1" in args.backends and failures == 0)
     return failures
 
 
@@ -173,14 +179,25 @@ def measure(args, device, emit):
             row = {"kind": args.mode, "backend": backend, "shape": list(shape),
                    "reference": "explicit_fp32_with_fp16_output", "case_seed": args.seed,
                    "score_probability_bytes_theoretical": score_probability_bytes}
-            fn = lambda: attention(q, k, v, backend, args.causal)
+            if backend == "l1" and n > L1_MAX_N:
+                emit(**row, status="skipped", reason=f"L1 只测小尺寸 N <= {L1_MAX_N}")
+                continue
             try:
+                if backend == "l1":
+                    row.update(threads_per_block=128, warps=4,
+                               allocation="preallocated" if args.mode == "bench" else "per_call")
+                else:
+                    row.update(allocation="per_call")
+                fn = (prepare_l1(q, k, v, args.causal) if backend == "l1" and args.mode == "bench"
+                      else lambda: attention(q, k, v, backend, args.causal))
                 metrics = errors(fn(), expected)
                 if metrics["failed_elements"]:
                     emit(**row, status="fail", **metrics)
                     failures += 1
                     continue
                 result = elapsed(fn, args) if args.mode == "bench" else peak_memory(fn)
+                if backend == "l1":
+                    result.update(workspace_bytes=score_probability_bytes, workspace_note="已知的两张 FP32 S/P 矩阵")
                 emit(**row, status="pass", **metrics, **result)
             except torch.cuda.OutOfMemoryError as exc:
                 emit(**row, status="skipped", reason=f"OOM：{exc}")
@@ -235,7 +252,9 @@ def main():
             "n": args.n, "backends": args.backends, "seed": args.seed, "warmup": args.warmup,
             "repeats": args.repeats, "groups": args.groups, "max_score_mib": args.max_score_mib,
             "tile": None, "warps": None, "timing": "eager_cuda_events_grouped_same_stream",
-            "allocation": "所有路径包含输出分配，显式路径还包含 FP32 转换和 S/P 分配"})
+            "allocation": "PyTorch 路径逐次分配；L1 计时预分配 S/P/O，memory 模式逐次分配",
+            "l1": {"threads_per_block": 128, "warps": 4, "max_n": L1_MAX_N,
+                   "cuda_flags": ["-O3", "-lineinfo"]}})
         if args.mode == "env":
             return 0
         with torch.inference_mode():

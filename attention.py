@@ -1,13 +1,31 @@
-"""L0：显式注意力公式、独立小尺寸参考与强制 SDPA 后端。"""
+"""L0/L1：注意力公式、独立参考、SDPA 后端与三个可读 CUDA kernel。"""
 
+from functools import cache
 import math
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
-BACKENDS = ("explicit", "math", "flash")
+BACKENDS = ("explicit", "math", "flash", "l1")
+L1_MAX_N = 512
+
+
+@cache
+def _load_l1():
+    """首次使用才编译；结果留在 PyTorch 扩展缓存，不写入仓库。"""
+    from torch.utils.cpp_extension import load
+
+    root = Path(__file__).resolve().parent
+    return load(
+        name="attention_lab_l1",
+        sources=[str(root / "bindings.cu"), str(root / "kernels" / "l1_materialized.cu")],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-lineinfo"],
+        verbose=False,
+    )
 
 
 def validate_inputs(q, k, v):
@@ -35,8 +53,28 @@ def explicit_attention(q, k, v, causal=False):
     return (probabilities @ v.float()).to(q.dtype)
 
 
+def prepare_l1(q, k, v, causal=False):
+    """一次检查并创建 S/P/O；返回固定缓冲的调用入口，供计时复用。"""
+    validate_inputs(q, k, v)
+    if q.device.type != "cuda" or q.shape[-2] > L1_MAX_N:
+        raise ValueError(f"L1 仅支持 CUDA、小尺寸 N <= {L1_MAX_N}")
+    module = _load_l1()
+    b, h, n, _ = q.shape
+    scores = torch.empty((b, h, n, n), device=q.device, dtype=torch.float32)
+    probabilities = torch.empty_like(scores)
+    output = torch.empty_like(q)
+
+    def run():
+        module.forward(q, k, v, scores, probabilities, output, causal)
+        return output
+
+    return run
+
+
 def attention(q, k, v, backend="explicit", causal=False):
     """公开入口；每次调用都明确限定一个后端，禁止自动回退。"""
+    if backend == "l1":
+        return prepare_l1(q, k, v, causal)()
     validate_inputs(q, k, v)
     if backend == "explicit":
         return explicit_attention(q, k, v, causal)
