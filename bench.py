@@ -12,12 +12,14 @@ import uuid
 
 import torch
 
-from attention import BACKENDS, L1_MAX_N, attention, prepare_l1, reference_fp64
+from attention import BACKENDS, L1_MAX_N, attention, prepare_l1, prepare_l2, reference_fp64
 
 
 ROOT = Path(__file__).resolve().parent
 # 固定 FP16 验收预算；失败时定位原因，不自动放宽阈值。
 ATOL, RTOL = 2e-3, 5e-3
+L2_CONFIG = {"q_tile": 4, "kv_tile": 64, "threads_per_block": 128, "warps": 4,
+             "cta_mapping": "one_cta_per_head_serial_q_tiles"}
 
 
 def command(argv):
@@ -68,6 +70,14 @@ def inputs(shape, device, seed, kind="random"):
     elif kind == "large_scores":
         q.mul_(4)
         k.mul_(4)
+    elif kind == "late_max":
+        # 将最大分数明确放在后续 K 块，检查旧累积是否按新最大值重新缩放。
+        q.zero_()
+        q[..., 0] = 8
+        k.zero_()
+        k[..., 0] = -8
+        k[:, :, 64:128, 0] = 0
+        k[:, :, 128:, 0] = 8
     return tuple(x.to(device=device, dtype=torch.float16) for x in (q, k, v))
 
 
@@ -85,8 +95,8 @@ def errors(actual, expected):
 
 def verify(args, device, emit):
     failures = 0
-    cases = [("random", n) for n in (1, 31, 32, 33, 63, 64, 65, 127, 128, 129)]
-    cases += [("zero_q", 33), ("large_scores", 65)]
+    cases = [("random", n) for n in (1, 2, 3, 4, 5, 31, 32, 33, 63, 64, 65, 127, 128, 129)]
+    cases += [("zero_q", 33), ("zero_q", 129), ("large_scores", 65), ("late_max", 129)]
     for index, (kind, n) in enumerate(cases):
         q, k, v = inputs((args.batch, args.heads, n, args.head_dim), device, args.seed + index, kind)
         expected = reference_fp64(q, k, v, args.causal)
@@ -103,7 +113,9 @@ def verify(args, device, emit):
             row = {"kind": "verify", "backend": backend, "case": kind,
                    "shape": list(q.shape), "case_seed": args.seed + index,
                    "reference": "cpu_fp64_rowwise"}
-            if device.type == "cpu" and backend in ("flash", "l1"):
+            if backend == "l2":
+                row.update(L2_CONFIG)
+            if device.type == "cpu" and backend in ("flash", "l1", "l2"):
                 emit(**row, status="skipped", reason="CPU 模式没有 CUDA 后端覆盖")
                 continue
             try:
@@ -114,16 +126,17 @@ def verify(args, device, emit):
             except (RuntimeError, NotImplementedError) as exc:
                 # 后端不可用也是本次验证未通过；不以另一个后端替代。
                 emit(**row, status="error", reason=str(exc))
-                if backend == "l1":
+                if backend in ("l1", "l2"):
                     # 编译失败只报告一次，停止本轮，避免每个形状重复构建。
                     emit(kind="verify_summary", status="fail", failed_cases=failures + 1,
-                         cuda_flash_verified=False, cuda_l1_verified=False)
+                         cuda_flash_verified=False, cuda_l1_verified=False, cuda_l2_verified=False)
                     return failures + 1
                 failures += 1
     emit(kind="verify_summary", status="pass" if failures == 0 else "fail",
          failed_cases=failures,
          cuda_flash_verified=device.type == "cuda" and "flash" in args.backends and failures == 0,
-         cuda_l1_verified=device.type == "cuda" and "l1" in args.backends and failures == 0)
+         cuda_l1_verified=device.type == "cuda" and "l1" in args.backends and failures == 0,
+         cuda_l2_verified=device.type == "cuda" and "l2" in args.backends and failures == 0)
     return failures
 
 
@@ -183,13 +196,17 @@ def measure(args, device, emit):
                 emit(**row, status="skipped", reason=f"L1 只测小尺寸 N <= {L1_MAX_N}")
                 continue
             try:
+                custom = backend in ("l1", "l2")
+                row.update(allocation="preallocated" if custom and args.mode == "bench" else "per_call")
                 if backend == "l1":
-                    row.update(threads_per_block=128, warps=4,
-                               allocation="preallocated" if args.mode == "bench" else "per_call")
+                    row.update(threads_per_block=128, warps=4)
+                elif backend == "l2":
+                    row.update(L2_CONFIG, shared_bytes_declared=266 * args.head_dim + 1024)
+                if custom and args.mode == "bench":
+                    prepare = prepare_l1 if backend == "l1" else prepare_l2
+                    fn = prepare(q, k, v, args.causal)
                 else:
-                    row.update(allocation="per_call")
-                fn = (prepare_l1(q, k, v, args.causal) if backend == "l1" and args.mode == "bench"
-                      else lambda: attention(q, k, v, backend, args.causal))
+                    fn = lambda: attention(q, k, v, backend, args.causal)
                 metrics = errors(fn(), expected)
                 if metrics["failed_elements"]:
                     emit(**row, status="fail", **metrics)
@@ -198,6 +215,8 @@ def measure(args, device, emit):
                 result = elapsed(fn, args) if args.mode == "bench" else peak_memory(fn)
                 if backend == "l1":
                     result.update(workspace_bytes=score_probability_bytes, workspace_note="已知的两张 FP32 S/P 矩阵")
+                elif backend == "l2":
+                    result.update(workspace_bytes=0, workspace_note="无额外全局张量；分块位于 shared，在线累积位于寄存器")
                 emit(**row, status="pass", **metrics, **result)
             except torch.cuda.OutOfMemoryError as exc:
                 emit(**row, status="skipped", reason=f"OOM：{exc}")
@@ -223,6 +242,7 @@ def main():
     parser.add_argument("--groups", type=int, default=5)
     parser.add_argument("--max-score-mib", type=int, default=512)
     parser.add_argument("--output", type=Path, help="追加到一个 JSONL 文件，省略时只打印")
+    parser.add_argument("--summary-only", action="store_true", help="精简终端输出，JSONL 文件仍保存完整记录")
     args = parser.parse_args()
     if min(args.batch, args.heads, *args.n, args.repeats, args.groups, args.max_score_mib) <= 0 or args.warmup < 0:
         parser.error("形状、次数和预算必须为正数，warmup 可为零")
@@ -241,7 +261,10 @@ def main():
         record = {"run_id": run_id, "time_utc": datetime.now(timezone.utc).isoformat(),
                   "dtype": "float16", "causal": args.causal, **row}
         line = json.dumps(record, ensure_ascii=False, allow_nan=False)
-        print(line, flush=True)
+        if (not args.summary_only or args.mode == "env"
+                or record["kind"] in ("verify_summary", "bench", "memory")
+                or record.get("status") in ("fail", "error", "skipped")):
+            print(line, flush=True)
         if stream:
             stream.write(line + "\n")
             stream.flush()
@@ -252,9 +275,11 @@ def main():
             "n": args.n, "backends": args.backends, "seed": args.seed, "warmup": args.warmup,
             "repeats": args.repeats, "groups": args.groups, "max_score_mib": args.max_score_mib,
             "tile": None, "warps": None, "timing": "eager_cuda_events_grouped_same_stream",
-            "allocation": "PyTorch 路径逐次分配；L1 计时预分配 S/P/O，memory 模式逐次分配",
+            "allocation": "PyTorch 路径逐次分配；L1/L2 计时预分配，memory 模式逐次分配",
             "l1": {"threads_per_block": 128, "warps": 4, "max_n": L1_MAX_N,
-                   "cuda_flags": ["-O3", "-lineinfo"]}})
+                   "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L1"]},
+            "l2": {**L2_CONFIG, "shared_bytes_declared": 266 * args.head_dim + 1024,
+                   "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L2"]}})
         if args.mode == "env":
             return 0
         with torch.inference_mode():
