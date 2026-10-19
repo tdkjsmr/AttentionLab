@@ -1,0 +1,252 @@
+"""统一执行 L0 正确性、CUDA events 计时及计时外显存检查。"""
+
+import argparse
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import platform
+import statistics
+import subprocess
+import sys
+import uuid
+
+import torch
+
+from attention import BACKENDS, attention, reference_fp64
+
+
+ROOT = Path(__file__).resolve().parent
+# 固定 FP16 验收预算；失败时定位原因，不自动放宽阈值。
+ATOL, RTOL = 2e-3, 5e-3
+
+
+def command(argv):
+    """只记录所需版本字段，不导出环境变量或用户配置。"""
+    try:
+        p = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=15)
+        return p.stdout.strip() if p.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def configure_precision():
+    # 小尺寸逐行 CPU 参考固定为单线程，避免小矩阵的线程调度开销。
+    torch.set_num_threads(1)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    setting = getattr(torch.backends.cuda, "allow_fp16_bf16_reduction_math_sdp", None)
+    if setting is not None:
+        setting(False)
+    return {"tf32": False, "fp16_reduced_precision_reduction": False,
+            "math_sdp_reduced_precision_reduction": False if setting else "api_unavailable"}
+
+
+def environment(device, precision):
+    git = ["git", "-c", f"safe.directory={ROOT.as_posix()}"]
+    status = command(git + ["status", "--porcelain", "--untracked-files=normal"])
+    data = {"python": platform.python_version(), "torch": torch.__version__,
+            "torch_cuda": torch.version.cuda, "git_sha": command(git + ["rev-parse", "HEAD"]),
+            "git_dirty": bool(status) if status is not None else None,
+            "device": str(device), "precision": precision, "cpu_num_threads": torch.get_num_threads(),
+            "nvcc": command(["nvcc", "--version"]),
+            "driver_inventory": command(["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
+                                          "--format=csv,noheader"])}
+    if device.type == "cuda":
+        prop = torch.cuda.get_device_properties(device)
+        data.update(gpu=prop.name, compute_capability=[prop.major, prop.minor],
+                    total_memory_bytes=prop.total_memory, cudnn=torch.backends.cudnn.version())
+    return data
+
+
+def inputs(shape, device, seed, kind="random"):
+    # 先在 CPU 生成再转换，所有后端使用同一组已经量化为 FP16 的输入。
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    q, k, v = [torch.randn(shape, generator=generator) for _ in range(3)]
+    if kind == "zero_q":
+        q.zero_()
+    elif kind == "large_scores":
+        q.mul_(4)
+        k.mul_(4)
+    return tuple(x.to(device=device, dtype=torch.float16) for x in (q, k, v))
+
+
+def errors(actual, expected):
+    actual = actual.to(device="cpu", dtype=torch.float64)
+    expected = expected.to(device="cpu", dtype=torch.float64)
+    diff = (actual - expected).abs()
+    bad = (~torch.isfinite(actual)) | (diff > ATOL + RTOL * expected.abs())
+    finite = bool(torch.isfinite(diff).all())
+    return {"max_abs": diff.max().item() if finite else None,
+            "normalized_l2": (diff.norm() / expected.norm().clamp_min(1e-30)).item() if finite else None,
+            "failed_elements": bad.sum().item(), "elements": actual.numel(),
+            "atol": ATOL, "rtol": RTOL}
+
+
+def verify(args, device, emit):
+    failures = 0
+    cases = [("random", n) for n in (1, 31, 32, 33, 63, 64, 65, 127, 128, 129)]
+    cases += [("zero_q", 33), ("large_scores", 65)]
+    for index, (kind, n) in enumerate(cases):
+        q, k, v = inputs((args.batch, args.heads, n, args.head_dim), device, args.seed + index, kind)
+        expected = reference_fp64(q, k, v, args.causal)
+        # 零 Q 还用独立解析关系检查；causal 对应各前缀的均值。
+        if kind == "zero_q":
+            values = v.to(device="cpu", dtype=torch.float64)
+            if args.causal:
+                count = torch.arange(1, n + 1, dtype=torch.float64).view(1, 1, n, 1)
+                analytic = values.cumsum(dim=-2) / count
+            else:
+                analytic = values.mean(dim=-2, keepdim=True).expand_as(values)
+            torch.testing.assert_close(expected, analytic, rtol=1e-12, atol=1e-12)
+        for backend in args.backends:
+            row = {"kind": "verify", "backend": backend, "case": kind,
+                   "shape": list(q.shape), "case_seed": args.seed + index,
+                   "reference": "cpu_fp64_rowwise"}
+            if device.type == "cpu" and backend == "flash":
+                emit(**row, status="skipped", reason="CPU 模式没有 CUDA flash 覆盖")
+                continue
+            try:
+                metrics = errors(attention(q, k, v, backend, args.causal), expected)
+                passed = metrics["failed_elements"] == 0
+                emit(**row, status="pass" if passed else "fail", **metrics)
+                failures += not passed
+            except (RuntimeError, NotImplementedError) as exc:
+                # 后端不可用也是本次验证未通过；不以另一个后端替代。
+                emit(**row, status="error", reason=str(exc))
+                failures += 1
+    emit(kind="verify_summary", status="pass" if failures == 0 else "fail",
+         failed_cases=failures,
+         cuda_flash_verified=device.type == "cuda" and "flash" in args.backends and failures == 0)
+    return failures
+
+
+def elapsed(fn, args):
+    for _ in range(args.warmup):
+        fn()
+    torch.cuda.synchronize()
+    samples = []
+    for _ in range(args.groups):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(args.repeats):
+            fn()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end) / args.repeats)
+    return {"gpu_elapsed_ms_median": statistics.median(samples), "group_ms_per_call": samples}
+
+
+def peak_memory(fn):
+    # 预热之后先等待；公共输入等存活分配计入 baseline，不计入增量峰值。
+    fn()
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    output = fn()
+    torch.cuda.synchronize()
+    result = {"baseline_allocated_bytes": baseline,
+              "incremental_peak_allocated_bytes": torch.cuda.max_memory_allocated() - baseline,
+              "output_bytes": output.numel() * output.element_size(),
+              "workspace_bytes": None, "workspace_note": "PyTorch 内部分配未通过公共接口暴露"}
+    return result
+
+
+def measure(args, device, emit):
+    failures = 0
+    for n in args.n:
+        shape = (args.batch, args.heads, n, args.head_dim)
+        # 两张 FP32 N*N 矩阵本身已需这些字节；这不是完整峰值估算。
+        score_probability_bytes = 2 * args.batch * args.heads * n * n * 4
+        if score_probability_bytes > args.max_score_mib * 1024**2:
+            emit(kind=args.mode, shape=list(shape), status="skipped",
+                 reason="显式 S/P 超出预先设置的内存预算", score_probability_bytes=score_probability_bytes)
+            continue
+        q, k, v = inputs(shape, device, args.seed)
+        try:
+            # 大尺寸仅用显式 FP32 路径配对检查；不冒称 FP64 独立真值。
+            expected = attention(q, k, v, "explicit", args.causal).cpu()
+        except torch.cuda.OutOfMemoryError as exc:
+            emit(kind=args.mode, shape=list(shape), status="skipped", reason=f"参考路径 OOM：{exc}")
+            continue
+        for backend in args.backends:
+            row = {"kind": args.mode, "backend": backend, "shape": list(shape),
+                   "reference": "explicit_fp32_with_fp16_output", "case_seed": args.seed,
+                   "score_probability_bytes_theoretical": score_probability_bytes}
+            fn = lambda: attention(q, k, v, backend, args.causal)
+            try:
+                metrics = errors(fn(), expected)
+                if metrics["failed_elements"]:
+                    emit(**row, status="fail", **metrics)
+                    failures += 1
+                    continue
+                result = elapsed(fn, args) if args.mode == "bench" else peak_memory(fn)
+                emit(**row, status="pass", **metrics, **result)
+            except torch.cuda.OutOfMemoryError as exc:
+                emit(**row, status="skipped", reason=f"OOM：{exc}")
+            except (RuntimeError, NotImplementedError) as exc:
+                emit(**row, status="error", reason=str(exc))
+                failures += 1
+    return failures
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("env", "verify", "bench", "memory"), default="verify")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--backends", nargs="+", choices=BACKENDS, default=list(BACKENDS))
+    parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--heads", type=int, default=8)
+    parser.add_argument("--head-dim", type=int, choices=(64, 128), default=64)
+    parser.add_argument("--n", nargs="+", type=int, default=[128, 512, 2048])
+    parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--seed", type=int, default=20261019)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--repeats", type=int, default=100)
+    parser.add_argument("--groups", type=int, default=5)
+    parser.add_argument("--max-score-mib", type=int, default=512)
+    parser.add_argument("--output", type=Path, help="追加到一个 JSONL 文件，省略时只打印")
+    args = parser.parse_args()
+    if min(args.batch, args.heads, *args.n, args.repeats, args.groups, args.max_score_mib) <= 0 or args.warmup < 0:
+        parser.error("形状、次数和预算必须为正数，warmup 可为零")
+    if args.device == "cpu" and args.mode in ("bench", "memory"):
+        parser.error("计时和显存检查仅支持 CUDA；CPU 只做公式验证")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        parser.error("当前 Python 的 CUDA 不可用；不要把 CPU 结果当作 GPU 验证")
+    device = torch.device(args.device)
+    precision = configure_precision()
+    run_id = uuid.uuid4().hex[:12]
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+    stream = args.output.open("a", encoding="utf-8") if args.output else None
+
+    def emit(**row):
+        record = {"run_id": run_id, "time_utc": datetime.now(timezone.utc).isoformat(),
+                  "dtype": "float16", "causal": args.causal, **row}
+        line = json.dumps(record, ensure_ascii=False, allow_nan=False)
+        print(line, flush=True)
+        if stream:
+            stream.write(line + "\n")
+            stream.flush()
+
+    try:
+        emit(kind="environment", **environment(device, precision), config={
+            "mode": args.mode, "batch": args.batch, "heads": args.heads, "head_dim": args.head_dim,
+            "n": args.n, "backends": args.backends, "seed": args.seed, "warmup": args.warmup,
+            "repeats": args.repeats, "groups": args.groups, "max_score_mib": args.max_score_mib,
+            "tile": None, "warps": None, "timing": "eager_cuda_events_grouped_same_stream",
+            "allocation": "所有路径包含输出分配，显式路径还包含 FP32 转换和 S/P 分配"})
+        if args.mode == "env":
+            return 0
+        with torch.inference_mode():
+            failures = verify(args, device, emit)
+            if failures == 0 and args.mode in ("bench", "memory"):
+                failures += measure(args, device, emit)
+        return 1 if failures else 0
+    finally:
+        if stream:
+            stream.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
