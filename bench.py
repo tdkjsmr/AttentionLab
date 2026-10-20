@@ -12,7 +12,7 @@ import uuid
 
 import torch
 
-from attention import BACKENDS, L1_MAX_N, attention, prepare_l1, prepare_l2, prepare_l3, reference_fp64
+from attention import BACKENDS, L1_MAX_N, attention, prepare_l1, prepare_l2, prepare_l3, prepare_l4, reference_fp64
 
 
 ROOT = Path(__file__).resolve().parent
@@ -24,6 +24,7 @@ L3_CONFIG = {"q_tile": 16, "kv_tile": 64, "threads_per_block": 128, "warps": 4,
              "cta_mapping": "one_cta_per_head_serial_q_tiles", "mma": "wmma_m16n16k16",
              "probability_dtype": "float16", "accumulator_dtype": "float32",
              "output_accumulator_storage": "shared"}
+L4_CONFIG = {**L3_CONFIG, "cta_mapping": "one_cta_per_q_tile"}
 
 
 def command(argv):
@@ -119,9 +120,11 @@ def verify(args, device, emit):
                    "reference": "cpu_fp64_rowwise"}
             if backend == "l2":
                 row.update(L2_CONFIG)
-            elif backend == "l3":
-                row.update(L3_CONFIG)
-            if device.type == "cpu" and backend in ("flash", "l1", "l2", "l3"):
+            elif backend in ("l3", "l4"):
+                tiles = 1 if backend == "l3" else (n + 15) // 16
+                row.update(L3_CONFIG if backend == "l3" else L4_CONFIG,
+                           cta_count=args.batch * args.heads * tiles)
+            if device.type == "cpu" and backend in ("flash", "l1", "l2", "l3", "l4"):
                 emit(**row, status="skipped", reason="CPU 模式没有 CUDA 后端覆盖")
                 continue
             try:
@@ -132,11 +135,12 @@ def verify(args, device, emit):
             except (RuntimeError, NotImplementedError) as exc:
                 # 后端不可用也是本次验证未通过；不以另一个后端替代。
                 emit(**row, status="error", reason=str(exc))
-                if backend in ("l1", "l2", "l3"):
+                if backend in ("l1", "l2", "l3", "l4"):
                     # 编译失败只报告一次，停止本轮，避免每个形状重复构建。
                     emit(kind="verify_summary", status="fail", failed_cases=failures + 1,
                          cuda_flash_verified=False, cuda_l1_verified=False, cuda_l2_verified=False,
-                         cuda_l3_verified=False, head_dim=args.head_dim, tested_cases=index + 1)
+                         cuda_l3_verified=False, cuda_l4_verified=False,
+                         head_dim=args.head_dim, tested_cases=index + 1)
                     return failures + 1
                 failures += 1
     emit(kind="verify_summary", status="pass" if failures == 0 else "fail",
@@ -145,6 +149,7 @@ def verify(args, device, emit):
          cuda_l1_verified=device.type == "cuda" and "l1" in args.backends and failures == 0,
          cuda_l2_verified=device.type == "cuda" and "l2" in args.backends and failures == 0,
          cuda_l3_verified=device.type == "cuda" and "l3" in args.backends and failures == 0,
+         cuda_l4_verified=device.type == "cuda" and "l4" in args.backends and failures == 0,
          head_dim=args.head_dim, tested_cases=len(cases))
     return failures
 
@@ -205,16 +210,19 @@ def measure(args, device, emit):
                 emit(**row, status="skipped", reason=f"L1 只测小尺寸 N <= {L1_MAX_N}")
                 continue
             try:
-                custom = backend in ("l1", "l2", "l3")
+                custom = backend in ("l1", "l2", "l3", "l4")
                 row.update(allocation="preallocated" if custom and args.mode == "bench" else "per_call")
                 if backend == "l1":
                     row.update(threads_per_block=128, warps=4)
                 elif backend == "l2":
                     row.update(L2_CONFIG, shared_bytes_declared=266 * args.head_dim + 1024)
-                elif backend == "l3":
-                    row.update(L3_CONFIG, shared_bytes_declared=224 * args.head_dim + 6272)
+                elif backend in ("l3", "l4"):
+                    tiles = 1 if backend == "l3" else (n + 15) // 16
+                    row.update(L3_CONFIG if backend == "l3" else L4_CONFIG,
+                               shared_bytes_declared=224 * args.head_dim + 6272,
+                               cta_count=args.batch * args.heads * tiles)
                 if custom and args.mode == "bench":
-                    prepare = {"l1": prepare_l1, "l2": prepare_l2, "l3": prepare_l3}[backend]
+                    prepare = {"l1": prepare_l1, "l2": prepare_l2, "l3": prepare_l3, "l4": prepare_l4}[backend]
                     fn = prepare(q, k, v, args.causal)
                 else:
                     fn = lambda: attention(q, k, v, backend, args.causal)
@@ -228,7 +236,7 @@ def measure(args, device, emit):
                     result.update(workspace_bytes=score_probability_bytes, workspace_note="已知的两张 FP32 S/P 矩阵")
                 elif backend == "l2":
                     result.update(workspace_bytes=0, workspace_note="无额外全局张量；分块位于 shared，在线累积位于寄存器")
-                elif backend == "l3":
+                elif backend in ("l3", "l4"):
                     result.update(workspace_bytes=0, workspace_note="无额外全局张量；分块和在线输出累积位于 shared")
                 emit(**row, status="pass", **metrics, **result)
             except torch.cuda.OutOfMemoryError as exc:
@@ -288,13 +296,15 @@ def main():
             "n": args.n, "backends": args.backends, "seed": args.seed, "warmup": args.warmup,
             "repeats": args.repeats, "groups": args.groups, "max_score_mib": args.max_score_mib,
             "tile": None, "warps": None, "timing": "eager_cuda_events_grouped_same_stream",
-            "allocation": "PyTorch 路径逐次分配；L1/L2/L3 计时预分配，memory 模式逐次分配",
+            "allocation": "PyTorch 路径逐次分配；L1/L2/L3/L4 计时预分配，memory 模式逐次分配",
             "l1": {"threads_per_block": 128, "warps": 4, "max_n": L1_MAX_N,
                    "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L1"]},
             "l2": {**L2_CONFIG, "shared_bytes_declared": 266 * args.head_dim + 1024,
                    "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L2"]},
             "l3": {**L3_CONFIG, "shared_bytes_declared": 224 * args.head_dim + 6272,
-                   "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L3"]}})
+                   "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L3"]},
+            "l4": {**L4_CONFIG, "shared_bytes_declared": 224 * args.head_dim + 6272,
+                   "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L4"]}})
         if args.mode == "env":
             return 0
         with torch.inference_mode():

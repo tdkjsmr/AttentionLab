@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
-BACKENDS = ("explicit", "math", "flash", "l1", "l2", "l3")
+BACKENDS = ("explicit", "math", "flash", "l1", "l2", "l3", "l4")
 L1_MAX_N = 512
 
 
@@ -20,7 +20,7 @@ def _load_cuda(backend):
 
     root = Path(__file__).resolve().parent
     source = {"l1": "l1_materialized.cu", "l2": "l2_tiled_online.cu",
-              "l3": "l3_wmma_online.cu"}[backend]
+              "l3": "l3_wmma_online.cu", "l4": "l4_q_parallel.cu"}[backend]
     return load(
         name=f"attention_lab_{backend}",
         sources=[str(root / "bindings.cu"), str(root / "kernels" / source)],
@@ -98,6 +98,11 @@ def prepare_l3(q, k, v, causal=False):
     return prepare_fused(q, k, v, "l3", causal)
 
 
+def prepare_l4(q, k, v, causal=False):
+    """创建 L4 固定输出，供计时复用。"""
+    return prepare_fused(q, k, v, "l4", causal)
+
+
 def attention(q, k, v, backend="explicit", causal=False):
     """公开入口；每次调用都明确限定一个后端，禁止自动回退。"""
     if backend == "l1":
@@ -106,6 +111,8 @@ def attention(q, k, v, backend="explicit", causal=False):
         return prepare_l2(q, k, v, causal)()
     if backend == "l3":
         return prepare_l3(q, k, v, causal)()
+    if backend == "l4":
+        return prepare_l4(q, k, v, causal)()
     validate_inputs(q, k, v)
     if backend == "explicit":
         return explicit_attention(q, k, v, causal)
