@@ -1,4 +1,4 @@
-"""验证并预热后，只采集选定的 L4/L5 kernel；另记录无需计数器的资源信息。"""
+"""验证并预热后，只采集选定的 L4/L5/L6 kernel；另记录无需计数器的资源信息。"""
 
 import argparse
 from contextlib import nullcontext
@@ -11,13 +11,13 @@ import torch
 import torch.cuda.nvtx
 import torch.cuda.profiler
 
-from attention import _load_cuda, attention, prepare_l4, prepare_l5
+from attention import _load_cuda, attention, prepare_l4, prepare_l5, prepare_l6
 from bench import configure_precision, environment, errors, inputs
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("l4", "l5"), default="l5")
+    parser.add_argument("--backend", choices=("l4", "l5", "l6"), default="l6")
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=64)
     parser.add_argument("--n", type=int, default=2048)
     parser.add_argument("--batch", type=int, default=1)
@@ -58,7 +58,7 @@ def main():
         emit(kind="environment", **environment(device, precision), config=config)
         with torch.inference_mode():
             q, k, v = inputs(shape, device, args.seed)
-            prepare = prepare_l4 if args.backend == "l4" else prepare_l5
+            prepare = {"l4": prepare_l4, "l5": prepare_l5, "l6": prepare_l6}[args.backend]
             run = prepare(q, k, v, args.causal)
             expected = attention(q, k, v, "explicit", args.causal)
             metrics = errors(run(), expected)

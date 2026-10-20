@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
-BACKENDS = ("explicit", "math", "flash", "l1", "l2", "l3", "l4", "l5")
+BACKENDS = ("explicit", "math", "flash", "l1", "l2", "l3", "l4", "l5", "l6")
 L1_MAX_N = 512
 
 
@@ -21,7 +21,7 @@ def _load_cuda(backend):
     root = Path(__file__).resolve().parent
     source = {"l1": "l1_materialized.cu", "l2": "l2_tiled_online.cu",
               "l3": "l3_wmma_online.cu", "l4": "l4_q_parallel.cu",
-              "l5": "l5_async_pipeline.cu"}[backend]
+              "l5": "l5_async_pipeline.cu", "l6": "l6_shared_reuse.cu"}[backend]
     return load(
         name=f"attention_lab_{backend}",
         sources=[str(root / "bindings.cu"), str(root / "kernels" / source)],
@@ -79,10 +79,10 @@ def prepare_fused(q, k, v, backend, causal=False):
     validate_inputs(q, k, v)
     if q.device.type != "cuda":
         raise ValueError(f"{backend.upper()} 仅支持 CUDA")
-    if backend == "l5" and torch.cuda.get_device_capability(q.device)[0] < 8:
-        raise RuntimeError("L5 的 cp.async 要求计算能力至少为 8.0")
+    if backend in ("l5", "l6") and torch.cuda.get_device_capability(q.device)[0] < 8:
+        raise RuntimeError(f"{backend.upper()} 的 cp.async 要求计算能力至少为 8.0")
     module = _load_cuda(backend)
-    if backend == "l5":
+    if backend in ("l5", "l6"):
         module.configure(q)
     output = torch.empty_like(q)
 
@@ -113,6 +113,11 @@ def prepare_l5(q, k, v, causal=False):
     return prepare_fused(q, k, v, "l5", causal)
 
 
+def prepare_l6(q, k, v, causal=False):
+    """配置 L6 的动态 shared 并创建固定输出，均在重复计时之前完成。"""
+    return prepare_fused(q, k, v, "l6", causal)
+
+
 def attention(q, k, v, backend="explicit", causal=False):
     """公开入口；每次调用都明确限定一个后端，禁止自动回退。"""
     if backend == "l1":
@@ -125,6 +130,8 @@ def attention(q, k, v, backend="explicit", causal=False):
         return prepare_l4(q, k, v, causal)()
     if backend == "l5":
         return prepare_l5(q, k, v, causal)()
+    if backend == "l6":
+        return prepare_l6(q, k, v, causal)()
     validate_inputs(q, k, v)
     if backend == "explicit":
         return explicit_attention(q, k, v, causal)

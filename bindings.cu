@@ -1,7 +1,7 @@
 // 只负责 Python 绑定；kernel 和启动代码放在各阶段自己的文件中。
 #include <torch/extension.h>
 
-#if defined(ATTENTION_LAB_L4) || defined(ATTENTION_LAB_L5)
+#if defined(ATTENTION_LAB_L4) || defined(ATTENTION_LAB_L5) || defined(ATTENTION_LAB_L6)
 #include <pybind11/stl.h>
 #include "kernels/launch_resources.cuh"
 #endif
@@ -30,6 +30,12 @@ void l5_configure(const at::Tensor& q);
 void l5_forward(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const at::Tensor& output, bool causal);
+#elif defined(ATTENTION_LAB_L6)
+LaunchResources l6_resources(const at::Tensor& q);
+void l6_configure(const at::Tensor& q);
+void l6_forward(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const at::Tensor& output, bool causal);
 #else
 #error "请选择本次编译的 CUDA 阶段"
 #endif
@@ -48,5 +54,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("resources", &l5_resources, "L5：编译资源与理论驻留上限");
     m.def("configure", &l5_configure, "L5：配置动态 shared 上限");
     m.def("forward", &l5_forward, "L5：异步拷贝与 WMMA 在线 softmax");
+#elif defined(ATTENTION_LAB_L6)
+    m.def("resources", &l6_resources, "L6：编译资源与理论驻留上限");
+    m.def("configure", &l6_configure, "L6：配置动态 shared 上限");
+    m.def("forward", &l6_forward, "L6：分数与概率原地复用的异步 WMMA");
 #endif
 }

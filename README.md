@@ -3,11 +3,11 @@
 ## 如何运行
 
 支持连续存储的 FP16 自注意力输入 `[B,H,N,D]`，D 为 64 或 128；提供 noncausal / causal 前向计算，不含反向与 dropout。
-可选后端：`explicit`、PyTorch SDPA `math` / `flash`，以及自定义 CUDA `l1` / `l2` / `l3` / `l4` / `l5`。`flash` 指 PyTorch 后端。
+可选后端：`explicit`、PyTorch SDPA `math` / `flash`，以及自定义 CUDA `l1` / `l2` / `l3` / `l4` / `l5` / `l6`。`flash` 指 PyTorch 后端。
 
 下面以 Linux、RTX 3090 为例。已使用的环境为 Python 3.12.3、PyTorch 2.5.1+cu124、CUDA toolkit 12.4.131。
 自定义 CUDA 扩展需要 nvcc、C++ 编译器和 Ninja；首次调用自动编译到 PyTorch 缓存。
-L5 要求计算能力至少 8.0；D128 所需的动态 shared 上限由准备入口配置，该配置位于重复计时之外。
+L5/L6 要求计算能力至少 8.0；D128 所需的动态 shared 上限由准备入口配置，该配置位于重复计时之外。
 
 基础 Python 已有可用 CUDA PyTorch 时，可以复用其包并创建独立环境：
 
@@ -25,17 +25,17 @@ python bench.py --mode env --output results/environment.jsonl
 若 Ninja 缺失，在当前环境内运行 `python -m pip install ninja`。其他 GPU 需按实际计算能力调整 `TORCH_CUDA_ARCH_LIST`。
 复用基础包的环境不锁定依赖；每次运行的 JSONL 会记录实际版本、GPU、提交 SHA 和工作区是否有修改。
 
-先验证 L5 的两个 D 和两种 mask：
+先配对验证 L5/L6 的两个 D 和两种 mask：
 
 ```bash
-python bench.py --mode verify --backends l5 --summary-only --output results/l5.jsonl
-python bench.py --mode verify --backends l5 --causal --summary-only --output results/l5.jsonl
-python bench.py --mode verify --backends l5 --head-dim 128 --summary-only --output results/l5.jsonl
-python bench.py --mode verify --backends l5 --head-dim 128 --causal --summary-only --output results/l5.jsonl
-python bench.py --mode verify --backends l4 l5 --batch 2 --heads 3 --head-dim 128 --causal --summary-only --output results/l5.jsonl
+python bench.py --mode verify --backends l5 l6 --summary-only --output results/l6.jsonl
+python bench.py --mode verify --backends l5 l6 --causal --summary-only --output results/l6.jsonl
+python bench.py --mode verify --backends l5 l6 --head-dim 128 --summary-only --output results/l6.jsonl
+python bench.py --mode verify --backends l5 l6 --head-dim 128 --causal --summary-only --output results/l6.jsonl
+python bench.py --mode verify --backends l5 l6 --batch 2 --heads 3 --head-dim 128 --causal --summary-only --output results/l6.jsonl
 ```
 
-每条命令应成功退出，汇总应为 `status=pass`、`failed_cases=0`、`cuda_l5_verified=true`。
+每条命令应成功退出，汇总应为 `status=pass`、`failed_cases=0`、`cuda_l5_verified=true`、`cuda_l6_verified=true`。
 前四条覆盖两个 D 和两种 mask，第五条检查多 batch/head 的配对结果。
 `head_dim` 和 `causal` 区分配置。未选择的其他后端，其验证标记为 false。
 小尺寸 N<=257 与 CPU FP64 参考比较，固定条件为 `abs(error) <= 0.002 + 0.005*abs(reference)`。
@@ -44,10 +44,10 @@ python bench.py --mode verify --backends l4 l5 --batch 2 --heads 3 --head-dim 12
 验证通过后进行同输入配对的计时与显存测量：
 
 ```bash
-python bench.py --mode bench --backends flash l4 l5 --n 128 512 2048 --summary-only --output results/l5.jsonl
-python bench.py --mode bench --backends flash l4 l5 --head-dim 128 --n 128 512 2048 --summary-only --output results/l5.jsonl
-python bench.py --mode memory --backends flash l4 l5 --n 128 512 2048 --summary-only --output results/l5.jsonl
-python bench.py --mode memory --backends flash l4 l5 --head-dim 128 --n 128 512 2048 --summary-only --output results/l5.jsonl
+python bench.py --mode bench --backends flash l5 l6 --n 128 512 2048 --summary-only --output results/l6.jsonl
+python bench.py --mode bench --backends flash l5 l6 --head-dim 128 --n 128 512 2048 --summary-only --output results/l6.jsonl
+python bench.py --mode memory --backends flash l5 l6 --n 128 512 2048 --summary-only --output results/l6.jsonl
+python bench.py --mode memory --backends flash l5 l6 --head-dim 128 --n 128 512 2048 --summary-only --output results/l6.jsonl
 ```
 
 - 默认 B=1、H=8、D=64、noncausal；添加 `--head-dim 128` 或 `--causal` 切换配置。
@@ -60,17 +60,18 @@ python bench.py --mode memory --backends flash l4 l5 --head-dim 128 --n 128 512 
 - `--max-score-mib 512` 限制配对参考所需的理论 S/P 字节数；超预算或 OOM 记 skipped。
 - JSONL 按 `run_id` 关联环境和结果。结果追加保存；复现配对测量时应固定完整 SHA，确认 `git_dirty=false`。
 
-采集 L4/L5 的编译资源与理论驻留上限，默认 N=2048。该步骤不需要安装 NSYS/NCU：
+采集 L5/L6 的编译资源与理论驻留上限，默认 N=2048。该步骤不需要安装 NSYS/NCU：
 
 ```bash
 mkdir -p results/profile
-for backend in l4 l5; do
+for backend in l5 l6; do
   for d in 64 128; do
     python profile_kernel.py --backend "$backend" --head-dim "$d" --output results/profile/resources.jsonl
   done
 done
 ```
 
+L6 的资源与计时结果以本次运行输出为准。
 资源 JSONL 记录寄存器、local/shared 字节数和理论驻留 CTA 数；理论占用率由 CUDA occupancy API 计算，不等于计数器测得的实际占用率。local 字节数也不能全部解释为寄存器溢出。
 入口会先与显式 FP32 路径检查数值，再预热；`--capture` 仅包围目标启动，编译、输出分配和检查均在区间外。
 `profile_summary=pass` 只表示入口执行成功，报告中是否有目标 kernel 与有效指标需要单独核对。
@@ -79,7 +80,7 @@ done
 
 ```bash
 nsys --version
-for backend in l4 l5; do
+for backend in l5 l6; do
   for d in 64 128; do
     prefix="results/profile/${backend}_d${d}"
     nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
@@ -95,7 +96,7 @@ done
 
 ```bash
 ncu --version
-for backend in l4 l5; do
+for backend in l5 l6; do
   for d in 64 128; do
     prefix="results/profile/${backend}_d${d}"
     if ! ncu --profile-from-start off --set full --launch-count 1 --export "$prefix" \
