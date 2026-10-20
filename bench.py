@@ -12,7 +12,7 @@ import uuid
 
 import torch
 
-from attention import BACKENDS, L1_MAX_N, attention, prepare_l1, prepare_l2, prepare_l3, prepare_l4, reference_fp64
+from attention import BACKENDS, L1_MAX_N, attention, prepare_l1, prepare_l2, prepare_l3, prepare_l4, prepare_l5, reference_fp64
 
 
 ROOT = Path(__file__).resolve().parent
@@ -25,6 +25,9 @@ L3_CONFIG = {"q_tile": 16, "kv_tile": 64, "threads_per_block": 128, "warps": 4,
              "probability_dtype": "float16", "accumulator_dtype": "float32",
              "output_accumulator_storage": "shared"}
 L4_CONFIG = {**L3_CONFIG, "cta_mapping": "one_cta_per_q_tile"}
+L5_CONFIG = {**L4_CONFIG, "async_copy": "cp.async.cg.shared.global", "copy_bytes": 16,
+             "kv_buffers": 2, "max_pending_copy_groups": 2, "shared_allocation": "dynamic",
+             "pipeline": "v_with_qk_next_k_with_pv", "min_compute_capability": [8, 0]}
 
 
 def command(argv):
@@ -82,7 +85,8 @@ def inputs(shape, device, seed, kind="random"):
         k.zero_()
         k[..., 0] = -8
         k[:, :, 64:128, 0] = 0
-        k[:, :, 128:, 0] = 8
+        last_start = (shape[-2] - 1) // 64 * 64
+        k[:, :, last_start:, 0] = 8
     return tuple(x.to(device=device, dtype=torch.float16) for x in (q, k, v))
 
 
@@ -100,8 +104,9 @@ def errors(actual, expected):
 
 def verify(args, device, emit):
     failures = 0
-    cases = [("random", n) for n in (1, 2, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129)]
-    cases += [("zero_q", 33), ("zero_q", 129), ("large_scores", 65), ("late_max", 129)]
+    cases = [("random", n) for n in (1, 2, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+                                     127, 128, 129, 191, 192, 193, 255, 256, 257)]
+    cases += [("zero_q", 33), ("zero_q", 129), ("large_scores", 65), ("late_max", 129), ("late_max", 257)]
     for index, (kind, n) in enumerate(cases):
         q, k, v = inputs((args.batch, args.heads, n, args.head_dim), device, args.seed + index, kind)
         expected = reference_fp64(q, k, v, args.causal)
@@ -120,11 +125,12 @@ def verify(args, device, emit):
                    "reference": "cpu_fp64_rowwise"}
             if backend == "l2":
                 row.update(L2_CONFIG)
-            elif backend in ("l3", "l4"):
+            elif backend in ("l3", "l4", "l5"):
                 tiles = 1 if backend == "l3" else (n + 15) // 16
-                row.update(L3_CONFIG if backend == "l3" else L4_CONFIG,
+                config = {"l3": L3_CONFIG, "l4": L4_CONFIG, "l5": L5_CONFIG}[backend]
+                row.update(config,
                            cta_count=args.batch * args.heads * tiles)
-            if device.type == "cpu" and backend in ("flash", "l1", "l2", "l3", "l4"):
+            if device.type == "cpu" and backend in ("flash", "l1", "l2", "l3", "l4", "l5"):
                 emit(**row, status="skipped", reason="CPU 模式没有 CUDA 后端覆盖")
                 continue
             try:
@@ -135,11 +141,11 @@ def verify(args, device, emit):
             except (RuntimeError, NotImplementedError) as exc:
                 # 后端不可用也是本次验证未通过；不以另一个后端替代。
                 emit(**row, status="error", reason=str(exc))
-                if backend in ("l1", "l2", "l3", "l4"):
+                if backend in ("l1", "l2", "l3", "l4", "l5"):
                     # 编译失败只报告一次，停止本轮，避免每个形状重复构建。
                     emit(kind="verify_summary", status="fail", failed_cases=failures + 1,
                          cuda_flash_verified=False, cuda_l1_verified=False, cuda_l2_verified=False,
-                         cuda_l3_verified=False, cuda_l4_verified=False,
+                         cuda_l3_verified=False, cuda_l4_verified=False, cuda_l5_verified=False,
                          head_dim=args.head_dim, tested_cases=index + 1)
                     return failures + 1
                 failures += 1
@@ -150,6 +156,7 @@ def verify(args, device, emit):
          cuda_l2_verified=device.type == "cuda" and "l2" in args.backends and failures == 0,
          cuda_l3_verified=device.type == "cuda" and "l3" in args.backends and failures == 0,
          cuda_l4_verified=device.type == "cuda" and "l4" in args.backends and failures == 0,
+         cuda_l5_verified=device.type == "cuda" and "l5" in args.backends and failures == 0,
          head_dim=args.head_dim, tested_cases=len(cases))
     return failures
 
@@ -210,19 +217,21 @@ def measure(args, device, emit):
                 emit(**row, status="skipped", reason=f"L1 只测小尺寸 N <= {L1_MAX_N}")
                 continue
             try:
-                custom = backend in ("l1", "l2", "l3", "l4")
+                custom = backend in ("l1", "l2", "l3", "l4", "l5")
                 row.update(allocation="preallocated" if custom and args.mode == "bench" else "per_call")
                 if backend == "l1":
                     row.update(threads_per_block=128, warps=4)
                 elif backend == "l2":
                     row.update(L2_CONFIG, shared_bytes_declared=266 * args.head_dim + 1024)
-                elif backend in ("l3", "l4"):
+                elif backend in ("l3", "l4", "l5"):
                     tiles = 1 if backend == "l3" else (n + 15) // 16
-                    row.update(L3_CONFIG if backend == "l3" else L4_CONFIG,
-                               shared_bytes_declared=224 * args.head_dim + 6272,
+                    config = {"l3": L3_CONFIG, "l4": L4_CONFIG, "l5": L5_CONFIG}[backend]
+                    shared_bytes = (352 if backend == "l5" else 224) * args.head_dim + 6272
+                    row.update(config, shared_bytes_declared=shared_bytes,
                                cta_count=args.batch * args.heads * tiles)
                 if custom and args.mode == "bench":
-                    prepare = {"l1": prepare_l1, "l2": prepare_l2, "l3": prepare_l3, "l4": prepare_l4}[backend]
+                    prepare = {"l1": prepare_l1, "l2": prepare_l2, "l3": prepare_l3,
+                               "l4": prepare_l4, "l5": prepare_l5}[backend]
                     fn = prepare(q, k, v, args.causal)
                 else:
                     fn = lambda: attention(q, k, v, backend, args.causal)
@@ -236,7 +245,7 @@ def measure(args, device, emit):
                     result.update(workspace_bytes=score_probability_bytes, workspace_note="已知的两张 FP32 S/P 矩阵")
                 elif backend == "l2":
                     result.update(workspace_bytes=0, workspace_note="无额外全局张量；分块位于 shared，在线累积位于寄存器")
-                elif backend in ("l3", "l4"):
+                elif backend in ("l3", "l4", "l5"):
                     result.update(workspace_bytes=0, workspace_note="无额外全局张量；分块和在线输出累积位于 shared")
                 emit(**row, status="pass", **metrics, **result)
             except torch.cuda.OutOfMemoryError as exc:
@@ -296,7 +305,7 @@ def main():
             "n": args.n, "backends": args.backends, "seed": args.seed, "warmup": args.warmup,
             "repeats": args.repeats, "groups": args.groups, "max_score_mib": args.max_score_mib,
             "tile": None, "warps": None, "timing": "eager_cuda_events_grouped_same_stream",
-            "allocation": "PyTorch 路径逐次分配；L1/L2/L3/L4 计时预分配，memory 模式逐次分配",
+            "allocation": "PyTorch 路径逐次分配；L1/L2/L3/L4/L5 计时预分配，memory 模式逐次分配",
             "l1": {"threads_per_block": 128, "warps": 4, "max_n": L1_MAX_N,
                    "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L1"]},
             "l2": {**L2_CONFIG, "shared_bytes_declared": 266 * args.head_dim + 1024,
@@ -304,7 +313,10 @@ def main():
             "l3": {**L3_CONFIG, "shared_bytes_declared": 224 * args.head_dim + 6272,
                    "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L3"]},
             "l4": {**L4_CONFIG, "shared_bytes_declared": 224 * args.head_dim + 6272,
-                   "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L4"]}})
+                   "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L4"]},
+            "l5": {**L5_CONFIG, "shared_bytes_declared": 352 * args.head_dim + 6272,
+                   "configure": "dynamic_shared_opt_in_before_timing",
+                   "cuda_flags": ["-O3", "-lineinfo", "-DATTENTION_LAB_L5"]}})
         if args.mode == "env":
             return 0
         with torch.inference_mode():

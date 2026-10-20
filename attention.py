@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
-BACKENDS = ("explicit", "math", "flash", "l1", "l2", "l3", "l4")
+BACKENDS = ("explicit", "math", "flash", "l1", "l2", "l3", "l4", "l5")
 L1_MAX_N = 512
 
 
@@ -20,7 +20,8 @@ def _load_cuda(backend):
 
     root = Path(__file__).resolve().parent
     source = {"l1": "l1_materialized.cu", "l2": "l2_tiled_online.cu",
-              "l3": "l3_wmma_online.cu", "l4": "l4_q_parallel.cu"}[backend]
+              "l3": "l3_wmma_online.cu", "l4": "l4_q_parallel.cu",
+              "l5": "l5_async_pipeline.cu"}[backend]
     return load(
         name=f"attention_lab_{backend}",
         sources=[str(root / "bindings.cu"), str(root / "kernels" / source)],
@@ -78,7 +79,11 @@ def prepare_fused(q, k, v, backend, causal=False):
     validate_inputs(q, k, v)
     if q.device.type != "cuda":
         raise ValueError(f"{backend.upper()} 仅支持 CUDA")
+    if backend == "l5" and torch.cuda.get_device_capability(q.device)[0] < 8:
+        raise RuntimeError("L5 的 cp.async 要求计算能力至少为 8.0")
     module = _load_cuda(backend)
+    if backend == "l5":
+        module.configure(q)
     output = torch.empty_like(q)
 
     def run():
@@ -103,6 +108,11 @@ def prepare_l4(q, k, v, causal=False):
     return prepare_fused(q, k, v, "l4", causal)
 
 
+def prepare_l5(q, k, v, causal=False):
+    """配置 L5 的动态 shared 并创建固定输出，均在重复计时之前完成。"""
+    return prepare_fused(q, k, v, "l5", causal)
+
+
 def attention(q, k, v, backend="explicit", causal=False):
     """公开入口；每次调用都明确限定一个后端，禁止自动回退。"""
     if backend == "l1":
@@ -113,6 +123,8 @@ def attention(q, k, v, backend="explicit", causal=False):
         return prepare_l3(q, k, v, causal)()
     if backend == "l4":
         return prepare_l4(q, k, v, causal)()
+    if backend == "l5":
+        return prepare_l5(q, k, v, causal)()
     validate_inputs(q, k, v)
     if backend == "explicit":
         return explicit_attention(q, k, v, causal)
@@ -128,8 +140,8 @@ def attention(q, k, v, backend="explicit", causal=False):
 def reference_fp64(q, k, v, causal=False):
     """CPU/FP64 逐 query 参考；不调用显式实现或 SDPA，仅用于小尺寸。"""
     validate_inputs(q, k, v)
-    if q.shape[-2] > 129:
-        raise ValueError("FP64 参考仅用于 N <= 129 的小尺寸")
+    if q.shape[-2] > 257:
+        raise ValueError("FP64 参考仅用于 N <= 257 的小尺寸")
     q64, k64, v64 = (x.to(device="cpu", dtype=torch.float64) for x in (q, k, v))
     result = torch.empty_like(q64)
     # 单独计算每行，以避免直接复用待测路径的整张分数矩阵与 mask。
