@@ -8,6 +8,7 @@
 #include <math_constants.h>
 #include <mma.h>
 #include <cstdint>
+#include "launch_resources.cuh"
 
 namespace {
 
@@ -201,6 +202,15 @@ void l5_configure(const at::Tensor& q) {
         C10_CUDA_CHECK(cudaFuncSetAttribute(wmma_online_kernel<128>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes<128>()));
     }
+}
+
+// 调用前由 prepare_l5 配置动态 shared 上限，查询时使用实际启动的字节数。
+LaunchResources l5_resources(const at::Tensor& q) {
+    const c10::cuda::CUDAGuard guard(q.device());
+    if (q.size(3) == 64) {
+        return query_launch_resources(wmma_online_kernel<64>, kThreads, shared_bytes<64>());
+    }
+    return query_launch_resources(wmma_online_kernel<128>, kThreads, shared_bytes<128>());
 }
 
 void l5_forward(

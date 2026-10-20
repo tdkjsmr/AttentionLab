@@ -8,6 +8,7 @@
 #include <math_constants.h>
 #include <mma.h>
 #include <cstdint>
+#include "launch_resources.cuh"
 
 namespace {
 
@@ -153,6 +154,14 @@ __global__ void wmma_online_kernel(
 }
 
 }  // 匿名命名空间
+
+LaunchResources l4_resources(const at::Tensor& q) {
+    const c10::cuda::CUDAGuard guard(q.device());
+    if (q.size(3) == 64) {
+        return query_launch_resources(wmma_online_kernel<64>, kThreads, 0);
+    }
+    return query_launch_resources(wmma_online_kernel<128>, kThreads, 0);
+}
 
 void l4_forward(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
